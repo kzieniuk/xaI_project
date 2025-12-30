@@ -1,35 +1,52 @@
 import os
-import requests
-import time
+import yfinance as yf
+import pandas as pd
 
 DATA_DIR = "data"
-BASE_URL = "https://raw.githubusercontent.com/fulifeng/Temporal_Relational_Stock_Ranking/master/data/google_finance/"
 
-FILES_TO_DOWNLOAD = [
-    "NASDAQ_AAPL_30Y.csv",
-    "NASDAQ_GOOG_30Y.csv",
-    "NASDAQ_MSFT_30Y.csv",
-    "NASDAQ_AMZN_30Y.csv",
-    "NASDAQ_AAL_30Y.csv"
+TICKERS = [
+    "AAPL",
+    "GOOG",
+    "MSFT",
+    "AMZN",
+    "AAL"
 ]
 
-def download_file(filename):
-    url = BASE_URL + filename
-    path = os.path.join(DATA_DIR, filename)
-    print(f"Downloading {filename}...")
+def download_ticker(ticker):
+    print(f"Downloading {ticker} from Yahoo Finance...")
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        with open(path, "wb") as f:
-            f.write(response.content)
-        print(f"Saved to {path}")
+        # data = yf.download(ticker, start="2000-01-01") # Caused issues
+        
+        # Use Ticker object and history() method
+        dat = yf.Ticker(ticker)
+        df = dat.history(start="2000-01-01")
+        
+        if df.empty:
+            print(f"No data found for {ticker}")
+            return
+
+        # yfinance returns MultiIndex columns in new versions mostly, but let's flatten or handle it
+        # usually simpler to just save directly
+        # Ensure we have a standard format: Date (index), Open, High, Low, Close, Volume
+        
+        # Reset index to make Date a column
+        df = df.reset_index()
+        
+        # Save to CSV using the same naming convention as before to be compatible with main.py
+        # Convention: NASDAQ_{ticker}_30Y.csv (even though it's not strictly 30Y or NASDAQ specific source now)
+        filename = f"NASDAQ_{ticker}_30Y.csv"
+        path = os.path.join(DATA_DIR, filename)
+        
+        df.to_csv(path, index=False)
+        print(f"Saved to {path} ({len(df)} rows)")
     except Exception as e:
-        print(f"Failed to download {filename}: {e}")
+        print(f"Failed to download {ticker}: {e}")
 
 if __name__ == "__main__":
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
     
-    for filename in FILES_TO_DOWNLOAD:
-        download_file(filename)
-        time.sleep(0.5)
+    print("Starting download...")
+    for ticker in TICKERS:
+        download_ticker(ticker)
+    print("Download complete.")

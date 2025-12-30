@@ -41,7 +41,7 @@ class MASCOTS:
         self.model = model
         self.sax = SAXTransformer(n_segments, alphabet_size)
 
-    def generate_counterfactual(self, query_ts, desired_outcome_fn, max_iter=1000):
+    def generate_counterfactual(self, query_ts, desired_outcome_fn, max_iter=100):
         """
         query_ts: original time series (numpy array)
         desired_outcome_fn: function(prediction) -> bool
@@ -61,7 +61,8 @@ class MASCOTS:
             # Select random segment
             idx = np.random.randint(0, len(current_paa))
             # Perturb value
-            perturbation = np.random.normal(0, 0.5)
+            # Log-returns are small (e.g., 0.01), so perturbation must be small
+            perturbation = np.random.normal(0, 0.005)
             candidate_paa = current_paa.copy()
             candidate_paa[idx] += perturbation
             
