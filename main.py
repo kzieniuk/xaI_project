@@ -84,7 +84,7 @@ def main():
     print(f"Test RMSE (Log-Return scale): {rmse:.6f}")
     
     # 2. Classification Accuracy for "Big Moves"
-    THRESHOLD_LOG_RET = 0.00
+    THRESHOLD_LOG_RET = 0.005 # Using 0.5% threshold for better stats
     
     cv_df['actual_big_move'] = cv_df['y'] > THRESHOLD_LOG_RET
     cv_df['pred_big_move'] = cv_df['iTransformer'] > THRESHOLD_LOG_RET
@@ -105,24 +105,7 @@ def main():
     print(f"  FN: {fn} | TN: {tn}")
     
     target_ticker = "AAPL"
-    aapl_cv = cv_df[cv_df['unique_id'] == target_ticker]
     
-    if not aapl_cv.empty:
-        plt.figure(figsize=(12, 6))
-        plt.plot(aapl_cv['ds'], aapl_cv['y'], label='Actual LogRet', alpha=0.5)
-        plt.plot(aapl_cv['ds'], aapl_cv['iTransformer'], label='Pred LogRet', alpha=0.5, linestyle='--')
-        plt.axhline(THRESHOLD_LOG_RET, color='red', linestyle=':', label=f'{THRESHOLD_LOG_RET*100}% Threshold')
-        
-        # Highlight True Positives
-        hits = aapl_cv[aapl_cv['pred_big_move'] & aapl_cv['actual_big_move']]
-        if not hits.empty:
-            plt.scatter(hits['ds'], hits['y'], color='green', marker='^', s=80, label='TP', zorder=5)
-            
-        plt.title(f"{target_ticker} Test (Last {EVAL_WINDOW} Days) - Log Returns\nAcc (>{THRESHOLD_LOG_RET*100}%): {accuracy:.2%} | RMSE: {rmse:.6f}")
-        plt.legend()
-        plt.savefig("test_evaluation_logret.png")
-        print("Saved plot to test_evaluation_logret.png")
-
     # --- 5. SHAP Analysis ---
     print("\n--- SHAP Analysis ---")
     # Prepare background data for SHAP (summary of training data)
@@ -152,53 +135,93 @@ def main():
     else:
         print("Not enough data for SHAP background.")
 
-    # --- 6. MASCOTS Counterfactual ---
-    print("\n--- MASCOTS Analysis ---")
-    target_series = df[df['unique_id'] == target_ticker]
-    query_ts = target_series['y'].values[-30:] # Last 30 days of log-returns
-    last_date = target_series['ds'].iloc[-1]
-    next_date = last_date + pd.Timedelta(days=1)
+    # --- 6. MASCOTS Counterfactuals (Top 3 High & Low) ---
+    print("\n--- MASCOTS Analysis (Top 3 Highest & Lowest Predictions) ---")
     
-    current_pred = model.predict_from_array(query_ts)
-    print(f"Current Prediction for {next_date.date()}: {current_pred:.4f}")
-
-    # Goal: Flip the sign of prediction (approx) or reach a significant threshold
+    # Sort by prediction value
+    cv_sorted = cv_df.sort_values('iTransformer')
     
-    target_threshold = 0.00
-    if current_pred < 0:
-        goal_desc = f"> {target_threshold}"
-        def condition(pred): return pred > target_threshold
-    else:
-        goal_desc = f"< -{target_threshold}"
-        def condition(pred): return pred < -target_threshold
-
-    print(f"Goal: Find counterfactual with prediction {goal_desc}")
-
+    # Select extreme cases
+    lowest_3 = cv_sorted.head(3)
+    highest_3 = cv_sorted.tail(3)
+    # Combine and add a label for context
+    extreme_cases = pd.concat([lowest_3, highest_3])
+    
     mascots = MASCOTS(model)
-    # Reduced max_iter for speed in demo
-    cf_ts, cf_pred = mascots.generate_counterfactual(query_ts, condition, max_iter=300)
     
-    if cf_ts is not None:
-        print(f"Counterfactual found! Original: {current_pred:.4f} -> Counterfactual: {cf_pred:.4f}")
+    for idx, row in extreme_cases.iterrows():
+        ticker = row['unique_id']
+        cutoff_date = row['cutoff']
+        pred_val = row['iTransformer']
         
-        plt.figure(figsize=(10, 6))
-        x_range = range(len(query_ts))
-        plt.plot(x_range, query_ts, label='Original History', marker='o', alpha=0.7)
-        plt.plot(x_range, cf_ts, label='Counterfactual History', linestyle='--', marker='x', alpha=0.7)
+        print(f"\nAnalyzing {ticker} at cutoff {cutoff_date} (Pred: {pred_val:.4f})")
         
-        plt.axhline(current_pred, color='blue', linestyle=':', label=f'Orig Pred: {current_pred:.4f}')
-        plt.axhline(cf_pred, color='green', linestyle=':', label=f'CF Pred: {cf_pred:.4f}')
+        # We need the 30 days LEADING UP TO the cutoff date
+        # Filter df for this ticker
+        ticker_df = df[df['unique_id'] == ticker]
         
-        plt.title(f"MASCOTS: {target_ticker} for {next_date.date()}\nChange: {current_pred:.4f} -> {cf_pred:.4f}")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
+        # Get data up to cutoff
+        mask = ticker_df['ds'] <= cutoff_date
+        history_window = ticker_df[mask].tail(30)
         
-        save_path = f"mascots_explanation_{target_ticker}.png"
-        plt.savefig(save_path)
-        print(f"Saved MASCOTS plot to {save_path}")
-    else:
-        print("No counterfactual found within iterations.")
+        if len(history_window) < 30:
+            print(f"Skipping {ticker} - Not enough history (found {len(history_window)})")
+            continue
+            
+        query_ts = history_window['y'].values
+        
+        # Verify prediction matches (sanity check)
+        check_pred = model.predict_from_array(query_ts)
+        # Note: model.predict_from_array might yield slightly diverse result due to dummy dates alignment 
+        # but should be very close.
+        # Check tolerance
+        if abs(check_pred - pred_val) > 0.0001:
+             print(f"  Note: Re-prediction {check_pred:.4f} differs from CV {pred_val:.4f}")
+        
+        # Define Goal: Flip sign
+        # If very positive -> make negative ( < -0.005)
+        # If very negative -> make positive ( > 0.005)
+        
+        target_threshold = 0.00
+        if pred_val > 0:
+            goal_desc = f"< -{target_threshold}"
+            def condition(p): return p < -target_threshold
+            case_type = "High_to_Low"
+        else:
+            goal_desc = f"> {target_threshold}"
+            def condition(p): return p > target_threshold
+            case_type = "Low_to_High"
+            
+        print(f"  Goal: {goal_desc}")
+        
+        cf_ts, cf_pred = mascots.generate_counterfactual(query_ts, condition, max_iter=200)
+        
+        if cf_ts is not None:
+            print(f"  Counterfactual found: {cf_pred:.4f}")
+            
+            plt.figure(figsize=(10, 6))
+            x_range = range(len(query_ts))
+            plt.plot(x_range, query_ts, label='Original', marker='o', alpha=0.7)
+            plt.plot(x_range, cf_ts, label='Counterfactual', linestyle='--', marker='x', alpha=0.7)
+            
+            plt.axhline(pred_val, color='blue', linestyle=':', label=f'Orig: {pred_val:.4f}')
+            plt.axhline(cf_pred, color='green', linestyle=':', label=f'CF: {cf_pred:.4f}')
+            
+            # Add date context
+            pred_date = row['ds']
+            plt.title(f"MASCOTS: {ticker} ({case_type})\nTarget Date: {pred_date} | {pred_val:.4f} -> {cf_pred:.4f}")
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            
+            # formatting date for filename
+            date_str = str(pred_date).split()[0]
+            save_path = f"mascots_{case_type}_{ticker}_{date_str}.png"
+            plt.savefig(save_path)
+            print(f"  Saved plot to {save_path}")
+            plt.close()
+        else:
+            print("  No counterfactual found.")
 
 if __name__ == "__main__":
     main()
