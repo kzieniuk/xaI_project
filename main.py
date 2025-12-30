@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from src.model import ForecastingModel
-from src.mascots import MASCOTS
+
 from src.xai import TimeSHAP
 
 def load_all_data(data_dir):
@@ -136,69 +136,68 @@ def main():
         print("Not enough data for SHAP background.")
 
     # --- 6. MASCOTS Counterfactuals (Top 3 High & Low) ---
-    print("\n--- MASCOTS Analysis (Top 3 Highest & Lowest Predictions) ---")
+    print("\n--- MASCOTS Analysis (Surrogate-Guided BoRF) ---")
     
-    # Sort by prediction value
+    # 1. Prepare Training Windows for Surrogate
+    print("Preparing background data for MASCOTS surrogate...")
+    train_vals = train_df['y'].values
+    # Create sliding windows from training data (input_size=30)
+    input_size = 30
+    training_windows = []
+    # Take a random sample or just stride to avoid excessive memory
+    # Last 2000 points, stride 1
+    recent_train = train_vals[-3000:]
+    for i in range(len(recent_train) - input_size):
+        training_windows.append(recent_train[i:i+input_size])
+    training_windows = np.array(training_windows)
+    
+    # 2. Init and Fit Explainer
+    from src.mascots import MascotsExplainer
+    explainer = MascotsExplainer(model, n_segments=5, alphabet_size=5, ngram=2)
+    explainer.fit(training_windows, sample_size=1024)
+    
+    # 3. Analyze Extremes (3 Strongest Highs, 3 Strongest Lows)
+    print("\nSelect top 3 strongest predictions for each class...")
     cv_sorted = cv_df.sort_values('iTransformer')
     
-    # Select extreme cases
-    lowest_3 = cv_sorted.head(3)
-    highest_3 = cv_sorted.tail(3)
-    # Combine and add a label for context
-    extreme_cases = pd.concat([lowest_3, highest_3])
+    # Class 0 (Low/Negative): Lowest values
+    strongest_class_0 = cv_sorted.head(3).copy()
+    strongest_class_0['label'] = 'Class 0 (Strong Negative)'
     
-    mascots = MASCOTS(model)
+    # Class 1 (High/Positive): Highest values
+    strongest_class_1 = cv_sorted.tail(3).copy()
+    strongest_class_1['label'] = 'Class 1 (Strong Positive)'
+    
+    # Combine (process Class 1 first maybe?)
+    extreme_cases = pd.concat([strongest_class_1, strongest_class_0])
     
     for idx, row in extreme_cases.iterrows():
         ticker = row['unique_id']
         cutoff_date = row['cutoff']
         pred_val = row['iTransformer']
+        label = row['label']
+
         
-        print(f"\nAnalyzing {ticker} at cutoff {cutoff_date} (Pred: {pred_val:.4f})")
+        print(f"\nAnalyzing {ticker} at {cutoff_date} (Pred: {pred_val:.4f})")
         
-        # We need the 30 days LEADING UP TO the cutoff date
-        # Filter df for this ticker
+        # Get query TS
         ticker_df = df[df['unique_id'] == ticker]
-        
-        # Get data up to cutoff
         mask = ticker_df['ds'] <= cutoff_date
         history_window = ticker_df[mask].tail(30)
         
-        if len(history_window) < 30:
-            print(f"Skipping {ticker} - Not enough history (found {len(history_window)})")
+        if len(history_window) < 30: 
             continue
-            
         query_ts = history_window['y'].values
         
-        # Verify prediction matches (sanity check)
-        check_pred = model.predict_from_array(query_ts)
-        # Note: model.predict_from_array might yield slightly diverse result due to dummy dates alignment 
-        # but should be very close.
-        # Check tolerance
-        if abs(check_pred - pred_val) > 0.0001:
-             print(f"  Note: Re-prediction {check_pred:.4f} differs from CV {pred_val:.4f}")
+        # Target Class: Flip Sign
+        # If Pred > 0 (Class 1) -> Target 0
+        # If Pred <= 0 (Class 0) -> Target 1
+        target_class = 0 if pred_val > 0 else 1
         
-        # Define Goal: Flip sign
-        # If very positive -> make negative ( < -0.005)
-        # If very negative -> make positive ( > 0.005)
-        
-        target_threshold = 0.00
-        if pred_val > 0:
-            goal_desc = f"< -{target_threshold}"
-            def condition(p): return p < -target_threshold
-            case_type = "High_to_Low"
-        else:
-            goal_desc = f"> {target_threshold}"
-            def condition(p): return p > target_threshold
-            case_type = "Low_to_High"
-            
-        print(f"  Goal: {goal_desc}")
-        
-        cf_ts, cf_pred = mascots.generate_counterfactual(query_ts, condition, max_iter=200)
+        cf_ts, cf_pred = explainer.explain(query_ts, target_class=target_class)
         
         if cf_ts is not None:
-            print(f"  Counterfactual found: {cf_pred:.4f}")
-            
+            # Plot
             plt.figure(figsize=(10, 6))
             x_range = range(len(query_ts))
             plt.plot(x_range, query_ts, label='Original', marker='o', alpha=0.7)
@@ -207,21 +206,16 @@ def main():
             plt.axhline(pred_val, color='blue', linestyle=':', label=f'Orig: {pred_val:.4f}')
             plt.axhline(cf_pred, color='green', linestyle=':', label=f'CF: {cf_pred:.4f}')
             
-            # Add date context
-            pred_date = row['ds']
-            plt.title(f"MASCOTS: {ticker} ({case_type})\nTarget Date: {pred_date} | {pred_val:.4f} -> {cf_pred:.4f}")
+            date_str = str(row['ds']).split()[0]
+            plt.title(f"MASCOTS: {ticker} on {date_str}\n{pred_val:.4f} -> {cf_pred:.4f}")
             plt.legend()
             plt.grid(True, alpha=0.3)
             plt.tight_layout()
             
-            # formatting date for filename
-            date_str = str(pred_date).split()[0]
-            save_path = f"mascots_{case_type}_{ticker}_{date_str}.png"
+            save_path = f"mascots_borf_{ticker}_{date_str}.png"
             plt.savefig(save_path)
             print(f"  Saved plot to {save_path}")
             plt.close()
-        else:
-            print("  No counterfactual found.")
 
 if __name__ == "__main__":
     main()

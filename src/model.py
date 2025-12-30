@@ -55,25 +55,42 @@ class ForecastingModel:
         Returns: (n_samples, )
         """
         n_samples, input_size = batch_values.shape
-        unique_ids = np.repeat([f"s_{i}" for i in range(n_samples)], input_size)
+        batch_size = 32 # Process in safer chunks manually
         
-        dates_single = pd.date_range(start='2000-01-01', periods=input_size, freq='D')
-        dates = np.tile(dates_single, n_samples)
+        all_forecasts = []
         
-        y_values = batch_values.flatten()
-        
-        df = pd.DataFrame({
-            'unique_id': unique_ids,
-            'ds': dates,
-            'y': y_values
-        })
-        
-        forecasts = self.model.predict(df=df)
-        
-        forecasts['id_num'] = forecasts['unique_id'].apply(lambda x: int(x.split('_')[1]))
-        forecasts = forecasts.sort_values('id_num')
-        
-        return forecasts['iTransformer'].values
+        for i in range(0, n_samples, batch_size):
+            batch_slice = batch_values[i:i+batch_size]
+            current_batch_size = len(batch_slice)
+            
+            # Vectorized dataframe creation for this chunk
+            unique_ids = np.repeat([f"s_{j}" for j in range(current_batch_size)], input_size)
+            
+            dates_single = pd.date_range(start='2000-01-01', periods=input_size, freq='D')
+            dates = np.tile(dates_single, current_batch_size)
+            
+            y_values = batch_slice.flatten()
+            
+            df = pd.DataFrame({
+                'unique_id': unique_ids,
+                'ds': dates,
+                'y': y_values
+            })
+            
+            # Predict on this chunk
+            # Note: We don't pass batch_size here, we let it process the whole small DF
+            # If the chunk is small enough, it won't trigger the internal batching err
+            chunk_forecasts = self.model.predict(df=df)
+            
+            # Extract values in order
+            # NeuralForecast usually preserves order of unique_ids passed in if distinct.
+            # But to be safe, we sort by our dummy ID
+            chunk_forecasts['id_num'] = chunk_forecasts['unique_id'].apply(lambda x: int(x.split('_')[1]))
+            chunk_forecasts = chunk_forecasts.sort_values('id_num')
+            
+            all_forecasts.append(chunk_forecasts['iTransformer'].values)
+            
+        return np.concatenate(all_forecasts)
 
     def cross_validation(self, df, n_windows=1, step_size=1):
         """
