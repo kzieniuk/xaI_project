@@ -4,3 +4,5 @@ lightning_logs/*
 *.png
 *.csv
 src/__pycache__/model.cpython-311.pyc
+/.venv
+.python-version
