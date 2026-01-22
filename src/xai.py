@@ -61,7 +61,8 @@ class TimeSHAP:
         
         norm_shap = (shap_values - np.min(shap_values)) / (np.max(shap_values) - np.min(shap_values) + 1e-9)
         
-        x = np.arange(len(feature_values))
+        # X-axis as relative days (-30 to -1)
+        x = np.arange(len(feature_values)) - len(feature_values)
         
         plt.plot(x, feature_values, 'k-', alpha=0.5, label='Time Series')
         
@@ -71,7 +72,7 @@ class TimeSHAP:
         
         plt.colorbar(label='SHAP Value (Impact on Prediction)')
         plt.title(f'SHAP Feature Importance (Base Value: {expected_value:.4f})')
-        plt.xlabel('Time Steps (t-30 to t-1)')
+        plt.xlabel('Days Before Prediction (t-x)')
         plt.ylabel('Log Return')
         plt.grid(True, alpha=0.3)
         

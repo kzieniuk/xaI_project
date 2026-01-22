@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from src.model import ForecastingModel
-
 from src.xai import TimeSHAP
 
 def load_all_data(data_dir):
@@ -19,18 +18,16 @@ def load_all_data(data_dir):
         df = pd.read_csv(filepath)
         if 'Date' not in df.columns and df.columns[0].startswith('Unnamed'):
             df.rename(columns={df.columns[0]: 'Date'}, inplace=True)
-        # Ensure UTC and remove tz info
         df['Date'] = pd.to_datetime(df['Date'], utc=True).dt.tz_localize(None)
         df = df.sort_values('Date')
         
-        # Compute Log Returns: ln(P_t / P_{t-1})
         df['log_ret'] = np.log(df['Close'] / df['Close'].shift(1))
         df = df.dropna()
         
         nf_df = pd.DataFrame({
             'unique_id': ticker,
             'ds': df['Date'],
-            'y': df['log_ret'] # Target is now Log Returns
+            'y': df['log_ret']
         })
         all_dfs.append(nf_df)
             
@@ -67,24 +64,20 @@ def main():
     print(f"Test Size: {len(test_df)}")
     
     print("\n--- 3. Training Model on Log-Returns ---")
-    # Horizon=1: Predicting next day's log-return
     model = ForecastingModel(horizon=1, input_size=30, n_series=n_series)
     model.train(train_df)
     
     print("\n--- 4. Testing (Rolling Window Evaluation) ---")
-    # Evaluate on the last 180 days of the test set for specific demonstration
     EVAL_WINDOW = 180
     print(f"Evaluating rolling window over last {EVAL_WINDOW} days of Test Set...")
     
     cv_df = model.cross_validation(df=df, n_windows=EVAL_WINDOW, step_size=1)
     
-    # 1. MSE
     cv_df['squared_error'] = (cv_df['y'] - cv_df['iTransformer']) ** 2
     rmse = np.sqrt(cv_df['squared_error'].mean())
     print(f"Test RMSE (Log-Return scale): {rmse:.6f}")
     
-    # 2. Classification Accuracy for "Big Moves"
-    THRESHOLD_LOG_RET = 0.005 # Using 0.5% threshold for better stats
+    THRESHOLD_LOG_RET = 0.005
     
     cv_df['actual_big_move'] = cv_df['y'] > THRESHOLD_LOG_RET
     cv_df['pred_big_move'] = cv_df['iTransformer'] > THRESHOLD_LOG_RET
@@ -106,7 +99,6 @@ def main():
     
     target_ticker = "AAPL"
     
-    # --- 5. SHAP Analysis ---
     print("\n--- SHAP Analysis ---")
     # Prepare background data for SHAP (summary of training data)
     train_target = train_df[train_df['unique_id'] == target_ticker]
@@ -153,23 +145,29 @@ def main():
     
     # 2. Init and Fit Explainer
     from src.mascots import MascotsExplainer
-    explainer = MascotsExplainer(model, n_segments=5, alphabet_size=5, ngram=2)
+    explainer = MascotsExplainer(model, n_segments=5, alphabet_size=10, ngram=2)
     explainer.fit(training_windows, sample_size=1024)
     
-    # 3. Analyze Extremes (3 Strongest Highs, 3 Strongest Lows)
-    print("\nSelect top 3 strongest predictions for each class...")
-    cv_sorted = cv_df.sort_values('iTransformer')
+    # 3. Analyze Target Cases (-20bps, -10bps, +10bps, +20bps)
+    print("\nSelect predictions closest to targets: -20bps, -10bps, +10bps, +20bps...")
     
-    # Class 0 (Low/Negative): Lowest values
-    strongest_class_0 = cv_sorted.head(3).copy()
-    strongest_class_0['label'] = 'Class 0 (Strong Negative)'
+    targets = [
+        (-0.0020, "Negative 20bps"),
+        (-0.0010, "Negative 10bps"),
+        (0.0010, "Positive 10bps"),
+        (0.0020, "Positive 20bps")
+    ]
     
-    # Class 1 (High/Positive): Highest values
-    strongest_class_1 = cv_sorted.tail(3).copy()
-    strongest_class_1['label'] = 'Class 1 (Strong Positive)'
+    selected_frames = []
+    for target_val, label_base in targets:
+        temp_df = cv_df.copy()
+        temp_df['diff'] = (temp_df['iTransformer'] - target_val).abs()
+        # Get top 2 closest
+        closest = temp_df.nsmallest(2, 'diff').copy()
+        closest['label'] = f"{label_base} (Target {target_val})"
+        selected_frames.append(closest)
     
-    # Combine (process Class 1 first maybe?)
-    extreme_cases = pd.concat([strongest_class_1, strongest_class_0])
+    extreme_cases = pd.concat(selected_frames)
     
     for idx, row in extreme_cases.iterrows():
         ticker = row['unique_id']
@@ -199,7 +197,9 @@ def main():
         if cf_ts is not None:
             # Plot
             plt.figure(figsize=(10, 6))
-            x_range = range(len(query_ts))
+            # Relative days: -30 to -1
+            x_range = np.arange(len(query_ts)) - len(query_ts)
+            
             plt.plot(x_range, query_ts, label='Original', marker='o', alpha=0.7)
             plt.plot(x_range, cf_ts, label='Counterfactual', linestyle='--', marker='x', alpha=0.7)
             
@@ -208,6 +208,8 @@ def main():
             
             date_str = str(row['ds']).split()[0]
             plt.title(f"MASCOTS: {ticker} on {date_str}\n{pred_val:.4f} -> {cf_pred:.4f}")
+            plt.xlabel("Days Before Prediction")
+            plt.ylabel("Log Returns")
             plt.legend()
             plt.grid(True, alpha=0.3)
             plt.tight_layout()

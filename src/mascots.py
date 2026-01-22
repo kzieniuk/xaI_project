@@ -236,7 +236,7 @@ class MascotsExplainer:
         best_cf_ts = None
         
         # Limit attempts
-        for idx, w in relevant_indices[:5]: # Try top 5 harmful grams
+        for idx, w in relevant_indices[:50]: # Try top 50 harmful grams
             bad_gram = self.vocab[idx] # tuple of chars
             # Find where this gram occurs in query
             # A gram is length ngram (3)
@@ -252,69 +252,59 @@ class MascotsExplainer:
             pos = curr_str.find(bad_gram_str)
             
             if pos != -1:
-                # Swap!
-                # Pick a random "good" gram
-                import random
-                replacement_gram = random.choice(good_grams)
-                
-                # Apply swap in SAX space
-                # Update list
-                for k in range(gram_len):
-                    cf_sax_list[pos+k] = replacement_gram[k]
-                
-                # Reconstruct and Test
-                new_sax_str = "".join(cf_sax_list)
-                
-                # Reconstruct continuous TS
-                # We need to map the NEW sax string back to values.
-                # But simple reconstruction destroys the original info of untouched segments!
-                # Better: Modify ONLY the swapped segments in the original TS.
-                
-                cf_ts = query_ts.copy()
-                
-                # Determine indices in TS corresponding to SAX segment
-                # SAX segment i covers indices [i*seg_len : (i+1)*seg_len]
-                segment_len = len(query_ts) // self.sax.n_segments
-                
-                for k in range(gram_len):
-                    sax_idx = pos + k
-                    char = replacement_gram[k]
+                # Try multiple replacements for this bad gram
+                for _ in range(20):
+                    # Pick a random "good" gram
+                    import random
+                    replacement_gram = random.choice(good_grams)
                     
-                    # Reconstruct value for this specific segment
-                    start = sax_idx * segment_len
-                    end = start + segment_len
+                    # Create a temp copy for this attempt
+                    temp_sax_list = cf_sax_list.copy()
                     
-                    # Get value from reconstructing just this char
-                    # Use breakpoint midpoint
-                    char_idx = ord(char) - 97
-                    lower = self.sax.breakpoints[char_idx-1] if char_idx > 0 else -2.0
-                    upper = self.sax.breakpoints[char_idx] if char_idx < len(self.sax.breakpoints) else 2.0
-                    val = (lower + upper) / 2.0
+                    # Apply swap in SAX space
+                    for k in range(gram_len):
+                        temp_sax_list[pos+k] = replacement_gram[k]
                     
-                    # De-normalize? We assumed TS was Z-normed for SAX.
-                    # We need mean/std of original query_ts to reverse.
-                    if np.std(query_ts) == 0:
-                         val_denorm = val + np.mean(query_ts)
-                    else:
-                         val_denorm = (val * np.std(query_ts)) + np.mean(query_ts)
+                    # Reconstruct and Test
+                    # Reconstruct continuous TS
+                    cf_ts = query_ts.copy()
                     
-                    # Check bounds
-                    # Flat fill
-                    cf_ts[start:end] = val_denorm
-                
-                # Check prediction
-                new_pred = self.blackbox_model.predict_from_array(cf_ts)
-                new_class = 1 if new_pred > 0 else 0
-                
-                if new_class == target_class:
-                    print(f"  Counterfactual Found! Swapped '{bad_gram_str}' with '{''.join(replacement_gram)}'")
-                    print(f"  New Pred: {new_pred:.4f}")
-                    return cf_ts, new_pred
-                else:
-                    # Revert for next try? Or keep evolving?
-                    # Greedy: revert if didn't help?
-                    # For simplicity, revert to try next harmful gram independently
-                    cf_sax_list = list(query_sax) # Reset
+                    # Determine indices in TS corresponding to SAX segment
+                    segment_len = len(query_ts) // self.sax.n_segments
+                    
+                    for k in range(gram_len):
+                        sax_idx = pos + k
+                        char = replacement_gram[k]
+                        
+                        # Reconstruct value for this specific segment
+                        start = sax_idx * segment_len
+                        end = start + segment_len
+                        
+                        # Get value from reconstructing just this char
+                        char_idx = ord(char) - 97
+                        lower = self.sax.breakpoints[char_idx-1] if char_idx > 0 else -2.0
+                        upper = self.sax.breakpoints[char_idx] if char_idx < len(self.sax.breakpoints) else 2.0
+                        val = (lower + upper) / 2.0
+                        
+                        # De-normalize?
+                        if np.std(query_ts) == 0:
+                             val_denorm = val + np.mean(query_ts)
+                        else:
+                             val_denorm = (val * np.std(query_ts)) + np.mean(query_ts)
+                        
+                        # Flat fill
+                        cf_ts[start:end] = val_denorm
+                    
+                    # Check prediction
+                    new_pred = self.blackbox_model.predict_from_array(cf_ts)
+                    new_class = 1 if new_pred > 0 else 0
+                    
+                    if new_class == target_class:
+                        print(f"  Counterfactual Found! Swapped '{bad_gram_str}' with '{''.join(replacement_gram)}'")
+                        print(f"  New Pred: {new_pred:.4f}")
+                        return cf_ts, new_pred
+                    
+                    # If this replacement didn't work, loop continues to try another random good gram
                     
         print("No counterfactual found.")
         return None, None
