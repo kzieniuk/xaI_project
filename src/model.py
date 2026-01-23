@@ -4,11 +4,11 @@ from neuralforecast import NeuralForecast
 from neuralforecast.models import iTransformer
 
 class ForecastingModel:
-    def __init__(self, horizon=1, input_size=30, n_series=1):
+    def __init__(self, horizon=1, input_size=30, n_series=1, max_steps=1500):
         self.horizon = horizon
         self.input_size = input_size
         self.model = NeuralForecast(
-            models=[iTransformer(h=horizon, input_size=input_size, n_series=n_series, max_steps=1500, accelerator='auto')],
+            models=[iTransformer(h=horizon, input_size=input_size, n_series=n_series, max_steps=max_steps, accelerator='auto')],
             freq='D'
         )
         self.is_fitted = False

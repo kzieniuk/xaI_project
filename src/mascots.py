@@ -153,7 +153,7 @@ class MascotsExplainer:
         print(f"Surrogate Fit Complete. Accuracy vs Blackbox Sign: {acc:.2%}")
         self.fitted = True
 
-    def explain(self, query_ts, target_class=None):
+    def explain(self, query_ts, target_class=None, max_harmful_grams=50, tries_per_gram=20, random_state=None, return_details=False):
         """
         Generate counterfactual for query_ts to flipped class.
         """
@@ -233,88 +233,116 @@ class MascotsExplainer:
         if not good_grams:
             good_grams = self.vocab # Fallback
             
-        best_cf_ts = None
+        valid_cfs = []
         
         # Limit attempts
-        for idx, w in relevant_indices[:5]: # Try top 5 harmful grams
+        for idx, w in relevant_indices[:max_harmful_grams]: # Try top N harmful grams
             bad_gram = self.vocab[idx] # tuple of chars
-            # Find where this gram occurs in query
-            # A gram is length ngram (3)
-            # Search in char list
             
-            # Simple substring search
+            # Helper for centroid logic
+            def get_centroid_vec(gram_tuple):
+                vec = []
+                for char in gram_tuple:
+                    idx = ord(char) - 97
+                    lower = self.sax.breakpoints[idx-1] if idx > 0 else -2.0
+                    upper = self.sax.breakpoints[idx] if idx < len(self.sax.breakpoints) else 2.0
+                    vec.append((lower + upper) / 2.0)
+                return np.array(vec)
+
+            # Control Perturbation: Find CLOSEST good gram
+            bad_vec = get_centroid_vec(bad_gram)
+            
+            # Sort good_grams by distance to bad_gram
+            good_grams_sorted = sorted(good_grams, key=lambda g: np.linalg.norm(bad_vec - get_centroid_vec(g)))
+            
+            # Pick from top K closest to allow some exploration (tries_per_gram)
+            candidates = good_grams_sorted[:tries_per_gram]
+
+            # Find where this gram occurs in query
             gram_len = len(bad_gram)
             
-            # There might be multiple occurrences, let's swap the first one found for now
-            # Convert list back to string for find
             curr_str = "".join(cf_sax_list)
             bad_gram_str = "".join(bad_gram)
             pos = curr_str.find(bad_gram_str)
             
             if pos != -1:
-                # Swap!
-                # Pick a random "good" gram
-                import random
-                replacement_gram = random.choice(good_grams)
+                # Batch Prediction Optimization
+                candidate_ts_list = []
+                candidate_grams = []
                 
-                # Apply swap in SAX space
-                # Update list
-                for k in range(gram_len):
-                    cf_sax_list[pos+k] = replacement_gram[k]
-                
-                # Reconstruct and Test
-                new_sax_str = "".join(cf_sax_list)
-                
-                # Reconstruct continuous TS
-                # We need to map the NEW sax string back to values.
-                # But simple reconstruction destroys the original info of untouched segments!
-                # Better: Modify ONLY the swapped segments in the original TS.
-                
-                cf_ts = query_ts.copy()
-                
-                # Determine indices in TS corresponding to SAX segment
-                # SAX segment i covers indices [i*seg_len : (i+1)*seg_len]
-                segment_len = len(query_ts) // self.sax.n_segments
-                
-                for k in range(gram_len):
-                    sax_idx = pos + k
-                    char = replacement_gram[k]
+                for replacement_gram in candidates:
+                    # Apply swap in SAX space
+                    cf_sax_list_try = list(cf_sax_list) 
+                    for k in range(gram_len):
+                        cf_sax_list_try[pos+k] = replacement_gram[k]
                     
-                    # Reconstruct value for this specific segment
-                    start = sax_idx * segment_len
-                    end = start + segment_len
+                    # Reconstruct continuous TS
+                    cf_ts = query_ts.copy()
+                    segment_len = len(query_ts) // self.sax.n_segments
                     
-                    # Get value from reconstructing just this char
-                    # Use breakpoint midpoint
-                    char_idx = ord(char) - 97
-                    lower = self.sax.breakpoints[char_idx-1] if char_idx > 0 else -2.0
-                    upper = self.sax.breakpoints[char_idx] if char_idx < len(self.sax.breakpoints) else 2.0
-                    val = (lower + upper) / 2.0
+                    for k in range(gram_len):
+                        sax_idx = pos + k
+                        char = replacement_gram[k]
+                        
+                        start = sax_idx * segment_len
+                        end = start + segment_len
+                        
+                        char_idx = ord(char) - 97
+                        lower = self.sax.breakpoints[char_idx-1] if char_idx > 0 else -2.0
+                        upper = self.sax.breakpoints[char_idx] if char_idx < len(self.sax.breakpoints) else 2.0
+                        val = (lower + upper) / 2.0
+                        
+                        if np.std(query_ts) == 0:
+                             val_denorm = val + np.mean(query_ts)
+                        else:
+                             val_denorm = (val * np.std(query_ts)) + np.mean(query_ts)
+                        
+                        cf_ts[start:end] = val_denorm
                     
-                    # De-normalize? We assumed TS was Z-normed for SAX.
-                    # We need mean/std of original query_ts to reverse.
-                    if np.std(query_ts) == 0:
-                         val_denorm = val + np.mean(query_ts)
-                    else:
-                         val_denorm = (val * np.std(query_ts)) + np.mean(query_ts)
-                    
-                    # Check bounds
-                    # Flat fill
-                    cf_ts[start:end] = val_denorm
+                    candidate_ts_list.append(cf_ts)
+                    candidate_grams.append(replacement_gram)
                 
-                # Check prediction
-                new_pred = self.blackbox_model.predict_from_array(cf_ts)
-                new_class = 1 if new_pred > 0 else 0
-                
-                if new_class == target_class:
-                    print(f"  Counterfactual Found! Swapped '{bad_gram_str}' with '{''.join(replacement_gram)}'")
-                    print(f"  New Pred: {new_pred:.4f}")
-                    return cf_ts, new_pred
-                else:
-                    # Revert for next try? Or keep evolving?
-                    # Greedy: revert if didn't help?
-                    # For simplicity, revert to try next harmful gram independently
-                    cf_sax_list = list(query_sax) # Reset
+                # Predict Batch
+                if candidate_ts_list:
+                    batch_preds = self.blackbox_model.predict_batch(np.array(candidate_ts_list))
                     
+                    for i, new_pred in enumerate(batch_preds):
+                        new_class = 1 if new_pred > 0 else 0
+                        
+                        if new_class == target_class:
+                           replacement_gram = candidate_grams[i]
+                           print(f"  Candidate CF found! Swapped '{bad_gram_str}' with '{''.join(replacement_gram)}'")
+                           valid_cfs.append((candidate_ts_list[i], new_pred))
+            
+            # Optimization: If we have enough candidates, stop searching to save time?
+            if len(valid_cfs) >= 10:
+                print("  Collected 10 valid candidates. Selecting best...")
+                break
+        
+        if valid_cfs:
+            print(f"Selecting best from {len(valid_cfs)} candidates based on Weighted MSE...")
+            # Selection Metric: Weighted MSE
+            # Weight increases closer to T (end of array)
+            T = len(query_ts)
+            weights = np.linspace(0.1, 10.0, T) # Strongly penalize recent changes
+            # Normalize? Not strictly needed for comparison
+            
+            best_cf = None
+            best_score = float('inf')
+            best_pred_val = 0
+            
+            for cf, pred_val in valid_cfs:
+                # Weighted MSE
+                sq_diff = (cf - query_ts) ** 2
+                weighted_mse = np.mean(sq_diff * weights)
+                
+                if weighted_mse < best_score:
+                    best_score = weighted_mse
+                    best_cf = cf
+                    best_pred_val = pred_val
+            
+            print(f"  Selected best CF with Weighted Score: {best_score:.4f}")
+            return best_cf, best_pred_val
+            
         print("No counterfactual found.")
         return None, None
