@@ -378,6 +378,20 @@ def main() -> None:
             }
         )
 
+        # Paper metrics (unitless, computed in scaled space): proximity + sparsity.
+        d_mv = (cf_mv.astype(np.float32) - query_mv.astype(np.float32)).astype(np.float32)
+        eps = 1e-6
+        sparsity_count = int(np.sum(np.abs(d_mv) > eps))
+        denom = int(d_mv.size) if d_mv.size else 0
+        result.update(
+            {
+                "proximity_l1_scaled": float(np.mean(np.abs(d_mv))) if denom else None,
+                "proximity_l2_scaled": float(np.sqrt(np.mean(d_mv * d_mv))) if denom else None,
+                "sparsity_count": sparsity_count,
+                "sparsity_ratio": float(sparsity_count / denom) if denom else None,
+            }
+        )
+
         if args.print_all_changes:
             print("\n--- All per-timestep changes (all selected cols; units) ---")
             for i, col in enumerate(cf_cols):

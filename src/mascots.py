@@ -8,7 +8,41 @@ class SAXTransformer:
     def __init__(self, n_segments=10, alphabet_size=5):
         self.n_segments = n_segments
         self.alphabet_size = alphabet_size
+        # Breakpoints for equal-probability bins under N(0,1)
         self.breakpoints = norm.ppf(np.linspace(0, 1, alphabet_size + 1)[1:-1])
+
+    def _segment_edges(self, original_len: int) -> np.ndarray:
+        if original_len <= 0:
+            raise ValueError("original_len must be > 0")
+        if self.n_segments <= 0:
+            raise ValueError("n_segments must be > 0")
+        # Distribute remainder across segments deterministically
+        return np.linspace(0, original_len, self.n_segments + 1, dtype=int)
+
+    def symbol_interval_z(self, symbol: str) -> tuple[float, float]:
+        """Return (lower, upper) bounds in z-space for a SAX symbol."""
+        if len(symbol) != 1:
+            raise ValueError("symbol must be a single character")
+        idx = ord(symbol) - 97
+        if idx < 0 or idx >= self.alphabet_size:
+            raise ValueError(f"symbol out of alphabet range: {symbol}")
+
+        q_lower = idx / self.alphabet_size
+        q_upper = (idx + 1) / self.alphabet_size
+
+        lower = float(norm.ppf(q_lower)) if q_lower > 0 else float("-inf")
+        upper = float(norm.ppf(q_upper)) if q_upper < 1 else float("inf")
+        return lower, upper
+
+    def symbol_centroid_z(self, symbol: str) -> float:
+        """Return a representative centroid in z-space for a SAX symbol."""
+        if len(symbol) != 1:
+            raise ValueError("symbol must be a single character")
+        idx = ord(symbol) - 97
+        if idx < 0 or idx >= self.alphabet_size:
+            raise ValueError(f"symbol out of alphabet range: {symbol}")
+        q = (idx + 0.5) / self.alphabet_size
+        return float(norm.ppf(q))
 
     def transform(self, X):
         """
@@ -25,12 +59,11 @@ class SAXTransformer:
             
             # PAA
             n = len(ts)
-            segment_len = n // self.n_segments
+            edges = self._segment_edges(n)
             paa = []
             for i in range(self.n_segments):
-                start = i * segment_len
-                end = start + segment_len
-                # Handle leftovers in last segment if needed, but assuming simple division
+                start = int(edges[i])
+                end = int(edges[i + 1])
                 paa.append(np.mean(ts_norm[start:end]))
             
             # SAX
@@ -46,19 +79,21 @@ class SAXTransformer:
         """
         Approximate reconstruction from SAX string (inverse PAA + simple upsampling)
         """
-        paa = []
-        for char in sax_string:
-            idx = ord(char) - 97
-            # Map index back to centroid of interval (approx)
-            # Simple assumption: uniform mapping to normal distribution centers?
-            # Or simplified: map to breakpoint midpoints
-            lower = self.breakpoints[idx-1] if idx > 0 else -2.0
-            upper = self.breakpoints[idx] if idx < len(self.breakpoints) else 2.0
-            val = (lower + upper) / 2.0
-            paa.append(val)
-            
-        segment_len = original_len // self.n_segments
-        return np.repeat(paa, segment_len)
+        paa = [self.symbol_centroid_z(char) for char in sax_string]
+        edges = self._segment_edges(original_len)
+        out = np.empty(original_len, dtype=np.float32)
+        for i, val in enumerate(paa):
+            start = int(edges[i])
+            end = int(edges[i + 1])
+            out[start:end] = val
+        return out
+
+    def reconstruct_denorm(self, sax_string: str, original_len: int, mean: float, std: float) -> np.ndarray:
+        """Reconstruct a numeric series in original units using provided mean/std."""
+        z = self.reconstruct(sax_string, original_len)
+        if std == 0:
+            return (z + mean).astype(np.float32)
+        return (z * std + mean).astype(np.float32)
 
 
 class MascotsExplainer:
@@ -100,13 +135,14 @@ class MascotsExplainer:
             vectors.append(vec)
         return np.vstack(vectors)
 
-    def fit(self, training_windows, sample_size=1000):
+    def fit(self, training_windows, sample_size=1000, random_state=None):
         """
         Train the surrogate model.
         training_windows: (N, T) array
         """
+        rng = np.random.default_rng(random_state)
         if len(training_windows) > sample_size:
-            idx = np.random.choice(len(training_windows), sample_size, replace=False)
+            idx = rng.choice(len(training_windows), size=sample_size, replace=False)
             X_train = training_windows[idx]
         else:
             X_train = training_windows
@@ -142,6 +178,7 @@ class MascotsExplainer:
         # Build Vocab
         all_grams = set().union(*[b.keys() for b in bags])
         self.vocab = sorted(list(all_grams))
+        self._vocab_map = {v: i for i, v in enumerate(self.vocab)}
         
         X_vec = self._vectorize(bags, self.vocab)
         
@@ -153,7 +190,15 @@ class MascotsExplainer:
         print(f"Surrogate Fit Complete. Accuracy vs Blackbox Sign: {acc:.2%}")
         self.fitted = True
 
-    def explain(self, query_ts, target_class=None):
+    def explain(
+        self,
+        query_ts,
+        target_class=None,
+        max_harmful_grams=20,
+        tries_per_gram=10,
+        random_state=None,
+        return_details: bool = False,
+    ):
         """
         Generate counterfactual for query_ts to flipped class.
         """
@@ -169,6 +214,7 @@ class MascotsExplainer:
             
         print(f"Explaining: Orig ({orig_pred_val:.4f}, Class {orig_class}) -> Target Class {target_class}")
         
+        query_ts = np.asarray(query_ts, dtype=np.float32)
         # Symbolize Query
         query_sax = self.sax.transform(query_ts.reshape(1, -1))[0]
         query_bag = self._borf([query_sax])[0]
@@ -191,11 +237,16 @@ class MascotsExplainer:
         # Find n-grams in the query that contribute most to the WRONG class (Original Class)
         # And replace them.
         
+        rng = None
+        if random_state is not None:
+            import random as _random
+            rng = _random.Random(random_state)
+
         # Get indices of grams present in query
         present_indices = []
         for gram, count in query_bag.items():
-            if gram in self.vocab:
-                idx = self.vocab.index(gram)
+            if gram in self._vocab_map:
+                idx = self._vocab_map[gram]
                 present_indices.append(idx)
                 
         # Filter weights by presence
@@ -216,6 +267,12 @@ class MascotsExplainer:
         
         # Try swapping
         cf_sax_list = list(query_sax)
+
+        # For denormalization of z-centroids back into the query_ts scale
+        ts_mean = float(np.mean(query_ts))
+        ts_std = float(np.std(query_ts))
+
+        edges = self.sax._segment_edges(len(query_ts))
         
         # Patterns to inject? 
         # User snippet: "np.random.randint" (random symbols).
@@ -236,7 +293,7 @@ class MascotsExplainer:
         best_cf_ts = None
         
         # Limit attempts
-        for idx, w in relevant_indices[:5]: # Try top 5 harmful grams
+        for idx, w in relevant_indices[:max_harmful_grams]:
             bad_gram = self.vocab[idx] # tuple of chars
             # Find where this gram occurs in query
             # A gram is length ngram (3)
@@ -254,67 +311,85 @@ class MascotsExplainer:
             if pos != -1:
                 # Swap!
                 # Pick a random "good" gram
-                import random
-                replacement_gram = random.choice(good_grams)
-                
-                # Apply swap in SAX space
-                # Update list
-                for k in range(gram_len):
-                    cf_sax_list[pos+k] = replacement_gram[k]
-                
-                # Reconstruct and Test
-                new_sax_str = "".join(cf_sax_list)
-                
-                # Reconstruct continuous TS
-                # We need to map the NEW sax string back to values.
-                # But simple reconstruction destroys the original info of untouched segments!
-                # Better: Modify ONLY the swapped segments in the original TS.
-                
-                cf_ts = query_ts.copy()
-                
-                # Determine indices in TS corresponding to SAX segment
-                # SAX segment i covers indices [i*seg_len : (i+1)*seg_len]
-                segment_len = len(query_ts) // self.sax.n_segments
-                
-                for k in range(gram_len):
-                    sax_idx = pos + k
-                    char = replacement_gram[k]
-                    
-                    # Reconstruct value for this specific segment
-                    start = sax_idx * segment_len
-                    end = start + segment_len
-                    
-                    # Get value from reconstructing just this char
-                    # Use breakpoint midpoint
-                    char_idx = ord(char) - 97
-                    lower = self.sax.breakpoints[char_idx-1] if char_idx > 0 else -2.0
-                    upper = self.sax.breakpoints[char_idx] if char_idx < len(self.sax.breakpoints) else 2.0
-                    val = (lower + upper) / 2.0
-                    
-                    # De-normalize? We assumed TS was Z-normed for SAX.
-                    # We need mean/std of original query_ts to reverse.
-                    if np.std(query_ts) == 0:
-                         val_denorm = val + np.mean(query_ts)
+                for _ in range(max(1, tries_per_gram)):
+                    if rng is None:
+                        import random
+                        replacement_gram = random.choice(good_grams)
                     else:
-                         val_denorm = (val * np.std(query_ts)) + np.mean(query_ts)
-                    
-                    # Check bounds
-                    # Flat fill
-                    cf_ts[start:end] = val_denorm
+                        replacement_gram = rng.choice(good_grams)
                 
-                # Check prediction
-                new_pred = self.blackbox_model.predict_from_array(cf_ts)
-                new_class = 1 if new_pred > 0 else 0
-                
-                if new_class == target_class:
-                    print(f"  Counterfactual Found! Swapped '{bad_gram_str}' with '{''.join(replacement_gram)}'")
-                    print(f"  New Pred: {new_pred:.4f}")
-                    return cf_ts, new_pred
-                else:
-                    # Revert for next try? Or keep evolving?
-                    # Greedy: revert if didn't help?
-                    # For simplicity, revert to try next harmful gram independently
-                    cf_sax_list = list(query_sax) # Reset
+                    # Apply swap in SAX space
+                    for k in range(gram_len):
+                        cf_sax_list[pos + k] = replacement_gram[k]
+
+                    # Reconstruct continuous TS by modifying only affected segments
+                    cf_ts = query_ts.copy()
+
+                    changed_segments = []
+                    for k in range(gram_len):
+                        sax_idx = pos + k
+                        old_char = query_sax[sax_idx]
+                        new_char = replacement_gram[k]
+
+                        start = int(edges[sax_idx])
+                        end = int(edges[sax_idx + 1])
+
+                        z_val = self.sax.symbol_centroid_z(new_char)
+                        if ts_std == 0:
+                            val_denorm = float(z_val + ts_mean)
+                        else:
+                            val_denorm = float(z_val * ts_std + ts_mean)
+                        cf_ts[start:end] = val_denorm
+
+                        if return_details:
+                            old_lower, old_upper = self.sax.symbol_interval_z(old_char)
+                            new_lower, new_upper = self.sax.symbol_interval_z(new_char)
+                            changed_segments.append(
+                                {
+                                    "segment_index": int(sax_idx),
+                                    "start": int(start),
+                                    "end": int(end),
+                                    "from_symbol": old_char,
+                                    "to_symbol": new_char,
+                                    "from_interval_z": (float(old_lower), float(old_upper)),
+                                    "to_interval_z": (float(new_lower), float(new_upper)),
+                                    "original_segment_mean": float(np.mean(query_ts[start:end])),
+                                    "counterfactual_value": float(val_denorm),
+                                }
+                            )
+
+                    new_pred = self.blackbox_model.predict_from_array(cf_ts)
+                    new_class = 1 if new_pred > 0 else 0
+
+                    if new_class == target_class:
+                        print(
+                            f"  Counterfactual Found! Swapped '{bad_gram_str}' with '{''.join(replacement_gram)}'"
+                        )
+                        print(f"  New Pred: {new_pred:.4f}")
+                        if not return_details:
+                            return cf_ts, new_pred
+
+                        details = {
+                            "query_sax": query_sax,
+                            "counterfactual_sax": "".join(cf_sax_list),
+                            "swap": {
+                                "pos": int(pos),
+                                "bad_gram": bad_gram_str,
+                                "replacement_gram": "".join(replacement_gram),
+                            },
+                            "changed_segments": changed_segments,
+                            "sax": {
+                                "n_segments": int(self.sax.n_segments),
+                                "alphabet_size": int(self.sax.alphabet_size),
+                                "ngram": int(self.ngram),
+                            },
+                        }
+                        return cf_ts, new_pred, details
+
+                    # Reset for next try
+                    cf_sax_list = list(query_sax)
                     
         print("No counterfactual found.")
+        if return_details:
+            return None, None, None
         return None, None

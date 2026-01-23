@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 
 @dataclass
 class Record:
@@ -23,6 +25,12 @@ class Record:
     cf_ts_units: list[float] | None
     delta_mv_units: list[list[float]] | None
     details: dict[str, Any] | None
+
+    # MASCOTS paper metrics (computed in scaled space, unitless)
+    proximity_l1_scaled: float | None
+    proximity_l2_scaled: float | None
+    sparsity_count: int | None
+    sparsity_ratio: float | None
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -63,6 +71,36 @@ def _as_record(row: dict[str, Any]) -> Record:
     if cf_ts_units is None:
         cf_ts_units = g("cf_ts_units")
 
+    # Paper metrics may be absent in older JSONL; try to infer from stored scaled sequences.
+    prox_l1 = g("proximity_l1_scaled")
+    prox_l2 = g("proximity_l2_scaled")
+    spar_count = g("sparsity_count")
+    spar_ratio = g("sparsity_ratio")
+
+    if prox_l1 is None or prox_l2 is None or spar_count is None or spar_ratio is None:
+        try:
+            eps = 1e-6
+            d = None
+            if g("cf_mv_scaled") is not None and g("query_mv_scaled") is not None:
+                c = np.asarray(g("cf_mv_scaled"), dtype=np.float32)
+                q = np.asarray(g("query_mv_scaled"), dtype=np.float32)
+                d = (c - q).astype(np.float32)
+            elif g("cf_ts_scaled") is not None and g("query_ts_scaled") is not None:
+                c = np.asarray(g("cf_ts_scaled"), dtype=np.float32)
+                q = np.asarray(g("query_ts_scaled"), dtype=np.float32)
+                d = (c - q).astype(np.float32)
+            if d is not None and d.size:
+                if prox_l1 is None:
+                    prox_l1 = float(np.mean(np.abs(d)))
+                if prox_l2 is None:
+                    prox_l2 = float(np.sqrt(np.mean(d * d)))
+                if spar_count is None:
+                    spar_count = int(np.sum(np.abs(d) > eps))
+                if spar_ratio is None:
+                    spar_ratio = float(spar_count / int(d.size))
+        except Exception:
+            pass
+
     return Record(
         win_idx=int(g("win_idx")),
         success=bool(g("success")),
@@ -80,6 +118,11 @@ def _as_record(row: dict[str, Any]) -> Record:
         cf_ts_units=cf_ts_units,
         delta_mv_units=g("delta_mv_units"),
         details=g("details"),
+
+        proximity_l1_scaled=prox_l1,
+        proximity_l2_scaled=prox_l2,
+        sparsity_count=spar_count,
+        sparsity_ratio=spar_ratio,
     )
 
 
@@ -165,6 +208,18 @@ def _fmt_example(r: Record) -> str:
         lines.append(f"- win_idx={r.win_idx} | success={r.success}")
     if r.num_changed_segments is not None:
         lines.append(f"  - changed_segments={r.num_changed_segments}, mean|Δ|_scaled={r.mean_abs_change_scaled:.4f}, max|Δ|_scaled={r.max_abs_change_scaled:.4f}")
+
+    if r.proximity_l1_scaled is not None or r.sparsity_ratio is not None:
+        parts = []
+        if r.proximity_l1_scaled is not None:
+            parts.append(f"proximity_l1_scaled={float(r.proximity_l1_scaled):.5f}")
+        if r.proximity_l2_scaled is not None:
+            parts.append(f"proximity_l2_scaled={float(r.proximity_l2_scaled):.5f}")
+        if r.sparsity_count is not None:
+            parts.append(f"sparsity_count={int(r.sparsity_count)}")
+        if r.sparsity_ratio is not None:
+            parts.append(f"sparsity_ratio={float(r.sparsity_ratio):.3%}")
+        lines.append("  - paper metrics: " + ", ".join(parts))
 
     mean_abs_u, max_abs_u, top_changes = _change_vs_input_units(r)
     if mean_abs_u is not None or max_abs_u is not None:
@@ -262,6 +317,10 @@ def main() -> None:
                 mean_abs_list.append(m)
             if mx is not None:
                 max_abs_list.append(mx)
+        prox_l1 = [float(r.proximity_l1_scaled) for r in successes if r.proximity_l1_scaled is not None]
+        prox_l2 = [float(r.proximity_l2_scaled) for r in successes if r.proximity_l2_scaled is not None]
+        spar = [float(r.sparsity_ratio) for r in successes if r.sparsity_ratio is not None]
+
         if mean_abs_list:
             srt = sorted(mean_abs_list)
             lines.append(f"- mean|Δ| vs input ({unit_s}): min={srt[0]:.3f}, median={srt[len(srt)//2]:.3f}, max={srt[-1]:.3f}")
@@ -269,10 +328,19 @@ def main() -> None:
             srt = sorted(max_abs_list)
             lines.append(f"- max|Δ| vs input ({unit_s}): min={srt[0]:.3f}, median={srt[len(srt)//2]:.3f}, max={srt[-1]:.3f}")
 
+        if prox_l1:
+            srt = sorted(prox_l1)
+            lines.append(f"- proximity_l1_scaled (successes): min={srt[0]:.5f}, median={srt[len(srt)//2]:.5f}, max={srt[-1]:.5f}")
+        if prox_l2:
+            srt = sorted(prox_l2)
+            lines.append(f"- proximity_l2_scaled (successes): min={srt[0]:.5f}, median={srt[len(srt)//2]:.5f}, max={srt[-1]:.5f}")
+        if spar:
+            srt = sorted(spar)
+            lines.append(f"- sparsity_ratio (successes): min={srt[0]:.3%}, median={srt[len(srt)//2]:.3%}, max={srt[-1]:.3%}")
+
     lines.append("\n## Most explainable examples")
     for r in explainable:
         lines.append(_fmt_example(r))
-
     lines.append("\n## Strongest ΔT examples")
     for r in strong:
         lines.append(_fmt_example(r))

@@ -282,20 +282,45 @@ class WeatherITransformerPredictorMulti:
 
 
 class JumpScoreWrapper:
-    """Turns a next-step prediction into a score = (pred - last_obs) - threshold."""
+    """Turns a next-step prediction into a score based on a jump event.
 
-    def __init__(self, predictor: WeatherITransformerPredictor, last_obs: float, threshold: float):
+    Modes:
+    - up:   score = (pred - last_obs) - threshold
+    - down: score = (last_obs - pred) - threshold
+    - abs:  score = abs(pred - last_obs) - threshold
+    """
+
+    def __init__(self, predictor: WeatherITransformerPredictor, last_obs: float, threshold: float, mode: str = "up"):
         self.predictor = predictor
         self.last_obs = float(last_obs)
         self.threshold = float(threshold)
+        self.mode = str(mode)
+
+    def _score(self, pred: float) -> float:
+        delta = float(pred) - self.last_obs
+        if self.mode == "up":
+            return float(delta - self.threshold)
+        if self.mode == "down":
+            return float((-delta) - self.threshold)
+        if self.mode == "abs":
+            return float(abs(delta) - self.threshold)
+        raise ValueError(f"Unknown jump mode: {self.mode}")
 
     def predict_from_array(self, values: np.ndarray) -> float:
         pred = self.predictor.predict_from_array(values)
-        return float((pred - self.last_obs) - self.threshold)
+        return self._score(float(pred))
 
     def predict_batch(self, batch_values: np.ndarray) -> np.ndarray:
         pred = self.predictor.predict_batch(batch_values)
-        return (pred - self.last_obs - self.threshold).astype(np.float32)
+        delta = pred.astype(np.float32) - np.float32(self.last_obs)
+        thr = np.float32(self.threshold)
+        if self.mode == "up":
+            return (delta - thr).astype(np.float32)
+        if self.mode == "down":
+            return ((-delta) - thr).astype(np.float32)
+        if self.mode == "abs":
+            return (np.abs(delta) - thr).astype(np.float32)
+        raise ValueError(f"Unknown jump mode: {self.mode}")
 
 
 def main() -> None:
@@ -319,6 +344,13 @@ def main() -> None:
         help="Comma-separated list of input columns allowed to change (multivariate CF).",
     )
     parser.add_argument("--jump-threshold-degc", type=float, default=1.0, help="Define 'dramatic' 10-min temperature jump")
+    parser.add_argument(
+        "--jump-mode",
+        type=str,
+        default="up",
+        choices=["up", "down", "abs"],
+        help="Event definition for score: up=(pred-last)-thr, down=(last-pred)-thr, abs=abs(pred-last)-thr",
+    )
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     # Must match the upstream checkpoint architecture
@@ -414,8 +446,12 @@ def main() -> None:
         block = train_block[s : s + args.seq_len]
         # (seq_len, N) -> (d_sel, seq_len)
         background_mv[i] = block[:, cf_idxs].T
-    # For baseline univariate MASCOTS we still need 1D background (temperature)
-    background_temp = background_mv[:, cf_cols.index(args.target_col), :]
+
+    # For baseline univariate MASCOTS we still need 1D background (target column),
+    # regardless of whether it is included in cf_cols.
+    background_temp = np.empty((k_bg, args.seq_len), dtype=np.float32)
+    for i, s in enumerate(starts):
+        background_temp[i] = train_block[s : s + args.seq_len, target_idx]
 
     # Predictor can be reused; we will update its context tensors per window
     # (x_ref and x_mark_ref are only used as templates for other channels/time features)
@@ -477,17 +513,39 @@ def main() -> None:
         query = x_ref[:, target_idx].astype(np.float32)
         query_mv = x_ref[:, cf_idxs].T.astype(np.float32)  # (d_sel, seq_len)
         last_obs = float(query[-1])
+
+        # Ground-truth value at the prediction horizon (scaled space)
+        true_next = float(test_scaled[win_idx + args.seq_len + args.horizon_step, target_idx])
+
+        def score_from_pred_scaled(pred_scaled: float) -> float:
+            delta = float(pred_scaled) - float(last_obs)
+            if args.jump_mode == "up":
+                return float(delta - threshold_scaled)
+            if args.jump_mode == "down":
+                return float((-delta) - threshold_scaled)
+            if args.jump_mode == "abs":
+                return float(abs(delta) - threshold_scaled)
+            raise ValueError(f"Unknown jump mode: {args.jump_mode}")
+
         if args.use_paper_mascots:
             # blackbox operates on multivariate selected inputs
             def bb_one(x_sel: np.ndarray) -> float:
                 pred = predictor_mv.predict_from_selected(cf_cols, x_sel)
-                return float((pred - last_obs) - threshold_scaled)
+                return score_from_pred_scaled(float(pred))
 
             def bb_batch(x_sel_batch: np.ndarray) -> np.ndarray:
                 pred = predictor_mv.predict_batch_from_selected(cf_cols, x_sel_batch)
-                return (pred - last_obs - threshold_scaled).astype(np.float32)
+                delta = pred.astype(np.float32) - np.float32(last_obs)
+                thr = np.float32(threshold_scaled)
+                if args.jump_mode == "up":
+                    return (delta - thr).astype(np.float32)
+                if args.jump_mode == "down":
+                    return ((-delta) - thr).astype(np.float32)
+                if args.jump_mode == "abs":
+                    return (np.abs(delta) - thr).astype(np.float32)
+                raise ValueError(f"Unknown jump mode: {args.jump_mode}")
         else:
-            jump_model = JumpScoreWrapper(predictor, last_obs=last_obs, threshold=threshold_scaled)
+            jump_model = JumpScoreWrapper(predictor, last_obs=last_obs, threshold=threshold_scaled, mode=args.jump_mode)
 
         if args.use_paper_mascots:
             base_score = float(bb_one(query_mv))
@@ -507,14 +565,28 @@ def main() -> None:
         base_pred_degC = inv(base_pred)
         base_delta_degC = base_pred_degC - last_obs_degC
 
+        true_next_degC = inv(true_next)
+        true_delta_degC = true_next_degC - last_obs_degC
+
         print("--- Setup ---")
         print(f"Target: {args.target_col} (index {target_idx})")
         print(f"Window idx (test): {win_idx}/{n_windows-1}")
         print(f"Last observed T: {last_obs_degC:.3f} °C")
         print(f"Predicted next-step T: {base_pred_degC:.3f} °C")
-        print(f"Predicted delta: {base_delta_degC:.3f} °C")
+        print(f"True next-step T: {true_next_degC:.3f} °C")
+        if args.jump_mode == "abs":
+            print(f"Predicted |delta|: {abs(base_delta_degC):.3f} °C")
+        elif args.jump_mode == "down":
+            print(f"Predicted down-delta: {(-base_delta_degC):.3f} °C")
+        else:
+            print(f"Predicted delta: {base_delta_degC:.3f} °C")
         print(f"Jump threshold: {args.jump_threshold_degc:.3f} °C")
-        print(f"Score = (delta - threshold): {(base_delta_degC-args.jump_threshold_degc):.3f} °C")
+        if args.jump_mode == "abs":
+            print(f"Score = (|delta| - threshold): {(abs(base_delta_degC)-args.jump_threshold_degc):.3f} °C")
+        elif args.jump_mode == "down":
+            print(f"Score = (-delta - threshold): {((-base_delta_degC)-args.jump_threshold_degc):.3f} °C")
+        else:
+            print(f"Score = (delta - threshold): {(base_delta_degC-args.jump_threshold_degc):.3f} °C")
         print(f"Score (scaled): {base_score:.4f} -> class {1 if base_score>0 else 0}")
 
         print("\n--- Counterfactual (MASCOTS) ---")
@@ -531,14 +603,35 @@ def main() -> None:
                 max_iters=args.max_iters,
                 random_state=args.seed,
             )
-            explainer_p.fit(background_mv, sample_size=min(args.surrogate_samples, len(background_mv)))
-            cf_mv, cf_score, det = explainer_p.explain(query_mv, target_class=target_class)
+            fit_ok = True
+            try:
+                explainer_p.fit(background_mv, sample_size=min(args.surrogate_samples, len(background_mv)))
+            except ValueError as e:
+                # Common corner case: all surrogate labels are the same (e.g. score always <= 0).
+                # In that case, we cannot train LogisticRegression; interpret as "no CF possible".
+                if "at least 2 classes" in str(e):
+                    print(f"Surrogate fit failed (single class); skipping window. Details: {e}")
+                    fit_ok = False
+                else:
+                    raise
+
+            if fit_ok:
+                cf_mv, cf_score, det = explainer_p.explain(query_mv, target_class=target_class)
+            else:
+                cf_mv, cf_score, det = None, None, None
             if cf_mv is None:
                 cf_ts = None
-                details = None
+                details = {
+                    "paper": True,
+                    "cf_cols": cf_cols,
+                    "fit_error": "single_class" if args.target_col not in cf_cols else None,
+                }
             else:
-                # Extract temperature channel from multivariate selection
-                cf_ts = cf_mv[cf_cols.index(args.target_col)].astype(np.float32)
+                # Extract temperature channel only if it is among cf_cols; otherwise target is frozen.
+                if args.target_col in cf_cols:
+                    cf_ts = cf_mv[cf_cols.index(args.target_col)].astype(np.float32)
+                else:
+                    cf_ts = query.astype(np.float32)
                 # Provide paper-style details for ambient analysis
                 details = {
                     "paper": True,
@@ -568,6 +661,9 @@ def main() -> None:
             "last_obs_degC": float(last_obs_degC),
             "base_pred_degC": float(base_pred_degC),
             "base_delta_degC": float(base_delta_degC),
+            "true_next_scaled": float(true_next),
+            "true_next_degC": float(true_next_degC),
+            "true_delta_degC": float(true_delta_degC),
             "threshold_degC": float(args.jump_threshold_degc),
             "threshold_scaled": float(threshold_scaled),
             "target_col": args.target_col,
@@ -685,6 +781,40 @@ def main() -> None:
                 "cf_ts_degC": (cf_ts.astype(np.float32) * temp_std + mean).astype(np.float32).tolist(),
             }
         )
+
+        # Paper metrics (unitless, computed in scaled space): proximity + sparsity.
+        # - proximity_l1_scaled: mean |Δ| over all edited degrees-of-freedom
+        # - proximity_l2_scaled: RMS(Δ)
+        # - sparsity_count: number of (channel,timestep) elements changed
+        # - sparsity_ratio: sparsity_count / (d*m)
+        if args.use_paper_mascots and result.get("cf_mv_scaled") is not None and result.get("query_mv_scaled") is not None:
+            q_mv = np.asarray(result["query_mv_scaled"], dtype=np.float32)
+            c_mv = np.asarray(result["cf_mv_scaled"], dtype=np.float32)
+            d_mv = (c_mv - q_mv).astype(np.float32)
+            eps = 1e-6
+            sparsity_count = int(np.sum(np.abs(d_mv) > eps))
+            denom = int(d_mv.size) if d_mv.size else 0
+            result.update(
+                {
+                    "proximity_l1_scaled": float(np.mean(np.abs(d_mv))) if denom else None,
+                    "proximity_l2_scaled": float(np.sqrt(np.mean(d_mv * d_mv))) if denom else None,
+                    "sparsity_count": sparsity_count,
+                    "sparsity_ratio": float(sparsity_count / denom) if denom else None,
+                }
+            )
+        else:
+            d_1d = (cf_ts.astype(np.float32) - query.astype(np.float32)).astype(np.float32)
+            eps = 1e-6
+            sparsity_count = int(np.sum(np.abs(d_1d) > eps))
+            denom = int(d_1d.size) if d_1d.size else 0
+            result.update(
+                {
+                    "proximity_l1_scaled": float(np.mean(np.abs(d_1d))) if denom else None,
+                    "proximity_l2_scaled": float(np.sqrt(np.mean(d_1d * d_1d))) if denom else None,
+                    "sparsity_count": sparsity_count,
+                    "sparsity_ratio": float(sparsity_count / denom) if denom else None,
+                }
+            )
 
         # Per-timestep deltas (always stored); for paper multivariate, store all selected cols.
         if args.use_paper_mascots:
